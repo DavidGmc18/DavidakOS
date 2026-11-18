@@ -10,6 +10,11 @@ void dtb_init(uptr dtb_ptr);
 u32 dtb_get_nr_address_cells();
 u32 dtb_get_nr_size_cells();
 
+uptr dtb_get_dtb_addr();
+usize dtb_get_dtb_size();
+
+const u32* dtb_get_mem_rsvmap();
+
 u32 dtb_find_node_with_name(u32 idx, const char* trgt);
 u32 dtb_find_node_with_prop(u32 start, const char* prop);
 u32 dtb_find_node_end(u32 start);

@@ -32,6 +32,7 @@ struct fdt_prop {
 static const struct fdt_header* header = NULL;
 static const u32* dt_struct = NULL;
 static const char* dt_strings = NULL;
+static const u32* mem_rsvmap = NULL;
 
 static u32 nr_address_cells;
 static u32 nr_size_cells;
@@ -44,9 +45,11 @@ void dtb_init(uptr dtb_ptr) {
 
     usize off_dt_struct = bswap32(header->off_dt_struct);
     usize off_dt_strings = bswap32(header->off_dt_strings);
+    usize off_mem_rsvmap = bswap32(header->off_mem_rsvmap);
 
     dt_struct = (const u32*)((uptr)header + off_dt_struct);
     dt_strings = (const char*)((uptr)header + off_dt_strings);
+    mem_rsvmap = (const u32*)((uptr)header + off_mem_rsvmap);
 
     struct dtb_prop prop = dtb_get_prop(DTB_ROOT, "#address-cells");
     if (!prop.addr || prop.len != 4) PANIC("[DTB] Unable to get #address-cells property\n"); 
@@ -65,6 +68,18 @@ u32 dtb_get_nr_address_cells() {
 
 u32 dtb_get_nr_size_cells() {
     return nr_size_cells;
+}
+
+uptr dtb_get_dtb_addr() {
+    return (uptr)header;
+}
+
+usize dtb_get_dtb_size() {
+    return bswap32(header->totalsize);
+}
+
+const u32* dtb_get_mem_rsvmap() {
+    return mem_rsvmap;
 }
 
 u32 dtb_find_node_with_name(u32 idx, const char* trgt) {
