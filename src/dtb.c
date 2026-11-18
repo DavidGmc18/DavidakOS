@@ -3,6 +3,7 @@
 #include <types.h>
 #include <string.h>
 #include <common.h>
+#include "panic.h"
 
 struct fdt_header {
     u32 magic;
@@ -32,6 +33,12 @@ static const struct fdt_header* header = NULL;
 static const u32* dt_struct = NULL;
 static const char* dt_strings = NULL;
 
+static u32 nr_address_cells;
+static u32 nr_size_cells;
+#define MAX_ADDRESS_CELLS 2
+#define MAX_SIZE_CELLS 2
+#define MAX_READ_CELLS 2
+
 void dtb_init(uptr dtb_ptr) {
     header = (const struct fdt_header*)dtb_ptr;
 
@@ -40,6 +47,24 @@ void dtb_init(uptr dtb_ptr) {
 
     dt_struct = (const u32*)((uptr)header + off_dt_struct);
     dt_strings = (const char*)((uptr)header + off_dt_strings);
+
+    struct dtb_prop prop = dtb_get_prop(DTB_ROOT, "#address-cells");
+    if (!prop.addr || prop.len != 4) PANIC("[DTB] Unable to get #address-cells property\n"); 
+    nr_address_cells = bswap32(*prop.addr);
+    if (!nr_address_cells || nr_address_cells > MAX_ADDRESS_CELLS) PANIC("[DTB] #address-cells is %u\n", nr_address_cells);
+
+    prop = dtb_get_prop(DTB_ROOT, "#size-cells");
+    if (!prop.addr || prop.len != 4) PANIC("[DTB] Unable to get #size-cells property\n");
+    nr_size_cells = bswap32(*prop.addr);
+    if (!nr_size_cells || nr_size_cells > MAX_SIZE_CELLS) PANIC("[DTB] #size-cells is %u\n", nr_size_cells);
+}
+
+u32 dtb_get_nr_address_cells() {
+    return nr_address_cells;
+}
+
+u32 dtb_get_nr_size_cells() {
+    return nr_size_cells;
 }
 
 u32 dtb_find_node_with_name(u32 idx, const char* trgt) {
@@ -193,6 +218,15 @@ struct dtb_prop dtb_get_prop(u32 idx, const char* trgt) {
                 return (struct dtb_prop){.addr=NULL, .len=0};
         }
     }
+}
+
+u64 dtb_read_cells(const u32* p, u32 n) {
+    if (!n || n > MAX_READ_CELLS) PANIC("[DTB] Invalid cell count: %u\n", n);
+    if ((uptr)p & 3) PANIC("[DTB] Unaligned cell pointer: %p\n", p);
+    u64 v = 0;
+    for (u32 i = 0; i < n; i++)
+        v = (v << 32) | bswap32(p[i]);
+    return v;
 }
 
 #define INDENT(n) do{for(int i=0;i<n;i++)putchar(' ');}while(0)
