@@ -15,10 +15,12 @@ typedef __UINT64_TYPE__ u64;
 // Size
 typedef __PTRDIFF_TYPE__ isize;
 typedef __SIZE_TYPE__ usize;
+#define USIZE_MAX ((usize)-1)
 
 // Pointers
 typedef __INTPTR_TYPE__ iptr;
 typedef __UINTPTR_TYPE__ uptr;
+#define UPTR_MAX ((uptr)-1)
 #define NULL ((void*)0)
 
 // VA
