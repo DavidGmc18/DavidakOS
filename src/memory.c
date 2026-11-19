@@ -6,9 +6,24 @@
 #include <string.h>
 #include "panic.h"
 
-#define PAGE_SIZE 4096
-
 extern char __kernel[], __kernel_end[];
+
+#define PAGE_SIZE 4096
+#define PAGE_MASK ((uptr)PAGE_SIZE-1)
+#define MAX_ORDER 11
+
+enum page_status : u8 {
+    PAGE_TAIL = 0x0,
+    PAGE_FREE = 0x1,
+    PAGE_USED = 0x2,
+    PAGE_RSVD = 0xFF,
+};
+
+struct page {
+    enum page_status status;
+    u8 order;
+    struct page* next;
+};
 
 struct memory_node {
     uptr addr;
@@ -19,6 +34,9 @@ struct memory_node {
 #define MAX_NODES 8
 static u32 node_count = 0;
 static struct memory_node nodes[MAX_NODES];
+
+static usize free_count[MAX_ORDER] = {};
+static struct page* free_list[MAX_ORDER] = {};
 
 static void add_memory_device(u32 device) {
     const char* name = dtb_get_node_name(device);
@@ -236,15 +254,138 @@ static void parse_reserved_regions(struct reserved_regions* rsv) {
     printf("[MEM] Registered %u effective reserved regions\n", rsv->count);
 }
 
+static bool next_free_gap(const struct memory_node* node, const struct reserved_regions* rsv, u32* idx, uptr* start, uptr* last) {
+    uptr node_last = node->addr + node->size - 1;
+
+    while (*idx <= rsv->count) {
+        u32 i = (*idx)++;
+        *start = node->addr;
+        *last = node_last;
+
+        if (i > 0) {
+            uptr prev_last;
+            if (add_overflow(rsv->regions[i-1].addr, rsv->regions[i-1].size - 1, &prev_last)) break;
+            if (prev_last >= *last) break;
+            if (prev_last >= *start) *start = prev_last + 1;
+        }
+
+        if (i < rsv->count) {
+            if (rsv->regions[i].addr <= *start) continue;
+            if (rsv->regions[i].addr <= *last) *last = rsv->regions[i].addr - 1;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+static void* boot_alloc(usize bytes, u32 align, struct memory_node* node, struct reserved_regions* rsv) {
+    if (!bytes || !align || (align & (align-1))) return NULL;
+    uptr mask = align - 1;
+
+    u32 idx = 0;
+    uptr start, last;
+    while (next_free_gap(node, rsv, &idx, &start, &last)) {
+        if ((start & mask) && add_overflow(start & ~mask, align, &start)) continue;
+        if (start > last) continue;
+        if (last - start < bytes - 1) continue;
+
+        add_reserved_region(rsv, start, bytes, "boot_alloc");
+        return (void*)start;
+    }
+
+    return NULL;
+}
+
+static u8 get_order_from_pfn(usize pfn) {
+    if (pfn == 0) return MAX_ORDER-1;
+    int order = __builtin_ctzll(pfn);
+    return (order < MAX_ORDER) ? order : MAX_ORDER-1;
+}
+
+static u8 get_order_from_count(usize count) {
+    if (count == 0) return 0;
+    int order = 63 - __builtin_clzll(count);
+    return (order < MAX_ORDER) ? order : MAX_ORDER-1;
+}
+
+static void add_free_buddy(struct page* page) {
+    if (page->status != PAGE_FREE) PANIC("[MEM] Failed to add buddy to free list: status is not PAGE_FREE\n");
+    if (page->order >= MAX_ORDER) PANIC("[MEM] Failed to add buddy to free list: order %u exceeds max allowed (%u)\n", page->order, MAX_ORDER-1);
+    if (page->next) PANIC("[MEM] Failed to add buddy to free list: page is already linked\n");
+    page->next = free_list[page->order];
+    free_list[page->order] = page;
+    free_count[page->order]++;
+}
+
+static void map_node(struct memory_node* node, struct reserved_regions* rsv) {
+    usize page_count = node->size / PAGE_SIZE;
+    usize map_size = page_count * sizeof(struct page);
+
+    node->map = boot_alloc(map_size, alignof(struct page), node, rsv);
+    if (!node->map) PANIC("[MEM] Failed to allocate page map for memory node\n");
+    
+    for (usize i = 0; i < page_count; i++) {
+        node->map[i] = (struct page){
+            .status = PAGE_RSVD,
+            .order = 0,
+        };
+    }
+
+    usize node_pfn = node->addr / PAGE_SIZE;
+
+    u32 idx = 0;
+    uptr start, last;
+    while (next_free_gap(node, rsv, &idx, &start, &last)) {
+        if ((start & PAGE_MASK) && add_overflow(start & ~PAGE_MASK, PAGE_SIZE, &start)) continue;
+        if (((last + 1) & PAGE_MASK) && sub_overflow(last & ~PAGE_MASK, 1, &last)) continue;
+        if (start > last) continue;
+
+        usize pfn = start / PAGE_SIZE;
+        usize last_pfn = last / PAGE_SIZE;
+        while (pfn <= last_pfn) {
+            u8 order = MIN(
+                get_order_from_pfn(pfn),
+                get_order_from_count(last_pfn - pfn + 1)
+            );
+            usize count = (usize)1 << order;
+
+            usize loc_pfn = pfn - node_pfn;
+            node->map[loc_pfn] = (struct page){
+                .status = PAGE_FREE,
+                .order = order,
+            };
+
+            for (usize j = 1; j < count; j++) {
+                node->map[loc_pfn+j] = (struct page){
+                    .status = PAGE_TAIL,
+                    .order = 0,
+                };
+            }
+
+            add_free_buddy(&node->map[loc_pfn]);
+
+            pfn += count;
+        }
+    }
+}
+
 void map_memory() {
     parse_memory_devices();
-    for (u32 i = 0; i < node_count; i++) {
-        printf("@%lx:%lx\n", nodes[i].addr, nodes[i].addr + nodes[i].size -1);
-    }
 
     struct reserved_regions rsv = {.count = 0};
     parse_reserved_regions(&rsv);
-    for (u32 i = 0; i < rsv.count; i++) {
-        printf("@%lx:%lx\n", rsv.regions[i].addr, rsv.regions[i].addr + rsv.regions[i].size -1);
+
+    for (u32 i = 0; i < node_count; i++) {
+        map_node(&nodes[i], &rsv);
     }
+
+    printf("[MEM] Buddy allocator free blocks:\n");
+    usize bytes = 0;
+    for (u32 i = 0; i < MAX_ORDER; i++) {
+        bytes += free_count[i] * ((usize)4096 << i);
+        printf("  [Order %u]: %lu blocks\n", i, free_count[i]);
+    }
+    printf("[MEM] Total free memory: %lu KiB\n", bytes / 1024);
 }
