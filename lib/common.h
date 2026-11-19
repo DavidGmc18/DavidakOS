@@ -6,3 +6,17 @@
 
 #define add_overflow(a, b, res) __builtin_add_overflow(a, b, res)
 #define sub_overflow(a, b, res) __builtin_sub_overflow(a, b, res)
+
+#define alignof(x) __alignof__(x)
+
+#define MIN(a, b) ({ \
+    typeof(a) _a = (a); \
+    typeof(b) _b = (b); \
+    _a < _b ? _a : _b; \
+})
+
+#define MAX(a, b) ({ \
+    typeof(a) _a = (a); \
+    typeof(b) _b = (b); \
+    _a > _b ? _a : _b; \
+})
