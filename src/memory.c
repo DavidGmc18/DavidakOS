@@ -1,5 +1,4 @@
 #include "memory.h"
-#include <types.h>
 #include "common.h"
 #include "dtb.h"
 #include <stdio.h>
@@ -11,19 +10,6 @@ extern char __kernel[], __kernel_end[];
 #define PAGE_SIZE 4096
 #define PAGE_MASK ((uptr)PAGE_SIZE-1)
 #define MAX_ORDER 11
-
-enum page_status : u8 {
-    PAGE_TAIL = 0x0,
-    PAGE_FREE = 0x1,
-    PAGE_USED = 0x2,
-    PAGE_RSVD = 0xFF,
-};
-
-struct page {
-    enum page_status status;
-    u8 order;
-    struct page* next;
-};
 
 struct memory_node {
     uptr addr;
@@ -310,11 +296,19 @@ static u8 get_order_from_count(usize count) {
     return (order < MAX_ORDER) ? order : MAX_ORDER-1;
 }
 
-static void add_free_buddy(struct page* page) {
-    if (page->status != PAGE_FREE) PANIC("[MEM] Failed to add buddy to free list: status is not PAGE_FREE\n");
+static void add_buddy_to_free_list(struct page* page) {
+    if (!page) PANIC("[MEM] Failed to add buddy to free list: null ptr\n");
+    if (page->status != PAGE_DIRTY) PANIC("[MEM] Failed to add buddy to free list: status is not PAGE_DIRTY\n");
     if (page->order >= MAX_ORDER) PANIC("[MEM] Failed to add buddy to free list: order %u exceeds max allowed (%u)\n", page->order, MAX_ORDER-1);
-    if (page->next) PANIC("[MEM] Failed to add buddy to free list: page is already linked\n");
+    if (page->prev || page->next) PANIC("[MEM] Failed to add buddy to free list: page is already linked\n");
+
+    page->status = PAGE_FREE;
     page->next = free_list[page->order];
+    page->prev = NULL;
+
+    if (free_list[page->order])
+        free_list[page->order]->prev = page;
+
     free_list[page->order] = page;
     free_count[page->order]++;
 }
@@ -353,7 +347,7 @@ static void map_node(struct memory_node* node, struct reserved_regions* rsv) {
 
             usize loc_pfn = pfn - node_pfn;
             node->map[loc_pfn] = (struct page){
-                .status = PAGE_FREE,
+                .status = PAGE_DIRTY,
                 .order = order,
             };
 
@@ -364,14 +358,14 @@ static void map_node(struct memory_node* node, struct reserved_regions* rsv) {
                 };
             }
 
-            add_free_buddy(&node->map[loc_pfn]);
+            add_buddy_to_free_list(&node->map[loc_pfn]);
 
             pfn += count;
         }
     }
 }
 
-void map_memory() {
+void mem_init() {
     parse_memory_devices();
 
     struct reserved_regions rsv = {.count = 0};
@@ -381,10 +375,181 @@ void map_memory() {
         map_node(&nodes[i], &rsv);
     }
 
+    mem_debug();
+}
+
+static struct page* get_buddy_from_free_list(u8 order) {
+    if (order >= MAX_ORDER) return NULL;
+    struct page* page = free_list[order];
+    if (!page) return NULL;
+    if (page->status != PAGE_FREE) PANIC("[MEM] Found page in free list that is not marked as free\n");
+    if (page->prev) PANIC("[MEM]");
+
+    free_list[order] = page->next;
+    if (free_list[order]) {
+        free_list[order]->prev = NULL;
+    }
+
+    page->status = PAGE_DIRTY;
+    page->prev = NULL;
+    page->next = NULL;
+
+    free_count[order]--;
+    return page;
+}
+
+static int split_dirty_buddy(struct page* page, u8 order) {
+    if (!page) PANIC("[MEM] Failed to split buddy: null ptr\n");
+    if (page->status != PAGE_DIRTY) PANIC("[MEM] Failed to split buddy: status is not PAGE_DIRTY\n");
+    if (page->order < order) return -1;
+    if (page->prev || page->next) PANIC("[MEM] Failed to split buddy: page is linked\n");
+
+    while (page->order > order) {
+        page->order--;
+        struct page* right = page + ((usize)1 << page->order);
+        right->status = PAGE_DIRTY;
+        right->order = page->order;
+        add_buddy_to_free_list(right);
+    }
+
+    return 0;
+}
+
+struct page* alloc_pages(u8 order) {    
+    for (u8 i = order; i < MAX_ORDER; i++) {
+        struct page* page = get_buddy_from_free_list(i);
+        if (!page) continue;
+        if (split_dirty_buddy(page, order)) PANIC("[MEM] Unexpectedly failed to split buddy, memory corruption?\n");
+        page->status = PAGE_USED;
+        return page;
+    }
+    return NULL;
+}
+
+static struct memory_node* get_node_from_page(const struct page* page) {
+    if (!page) PANIC("[MEM] Failed to get node: null ptr\n");
+    for (u32 i = 0; i < node_count; i++) {
+        if (page < nodes[i].map) continue;
+        usize loc_pfn = ((uptr)page - (uptr)nodes[i].map) / sizeof(struct page);
+        usize page_count = nodes[i].size / PAGE_SIZE;
+        if (loc_pfn >= page_count) continue;
+        return &nodes[i];
+    }
+    return NULL;
+}
+
+static usize get_pfn_from_page(const struct page* page, const struct memory_node* node) {
+    if (!page || !node) PANIC("[MEM] Failed to get pfn: null ptr\n");
+    if (page < node->map) return 0;
+    usize loc_pfn = ((uptr)page - (uptr)node->map) / sizeof(struct page);
+    usize page_count = node->size / PAGE_SIZE;
+    if (loc_pfn >= page_count) return 0;
+    return node->addr / PAGE_SIZE + loc_pfn;
+}
+
+static int unlink_free_buddy(struct page* page) {
+    if (!page) PANIC("[MEM] Failed to unlink buddy from free list: null ptr\n");
+    if (page->status != PAGE_FREE) return -1;
+    if (page->order >= MAX_ORDER) PANIC("[MEM] Failed to unlink buddy from free list: order %u exceeds max allowed (%u)\n", page->order, MAX_ORDER-1);
+
+    if (page->prev) {
+        page->prev->next = page->next;
+    } else {
+        free_list[page->order] = page->next;
+    }
+    
+    if (page->next) {
+        page->next->prev = page->prev;
+    }
+
+    page->status = PAGE_DIRTY;
+    page->prev = NULL;
+    page->next = NULL;
+
+    free_count[page->order]--;
+
+    return 0;
+}
+
+static struct page* merge_buddy_with_free(struct page* page) {
+    if (!page) PANIC("[MEM] Failed to merge buddy: null ptr\n");
+    if (page->status != PAGE_DIRTY) PANIC("[MEM] Failed to merge buddy: page is not marked as dirty\n");
+
+    struct memory_node* node = get_node_from_page(page);
+    if (!node) PANIC("[MEM] Failed to merge buddy: page does not belong to any node\n");
+
+    while (page->order < MAX_ORDER-1) {
+        usize pfn = get_pfn_from_page(page, node);
+        u8 pos_order = get_order_from_pfn(pfn);
+
+        if (pos_order > page->order) {
+            struct page* right = page + ((usize)1 << page->order);
+            if (right >= &node->map[node->size/PAGE_SIZE]) break;
+            if (right->status != PAGE_FREE) break;
+            if (right->order != page->order) break;
+
+            if (unlink_free_buddy(right)) PANIC("[MEM] Unexpectedly failed to merge buddy\n");
+
+            page->order++;
+            right->status = PAGE_TAIL;
+            right->order = 0;
+
+        } else {
+            struct page* left = page - ((usize)1 << page->order);
+            if (left < node->map) break;
+            if (left->status != PAGE_FREE) break;
+            if (left->order != page->order) break;
+
+            if (unlink_free_buddy(left)) PANIC("[MEM] Unexpectedly failed to merge buddy\n");
+
+            left->order++;
+            page->status = PAGE_TAIL;
+            page->order = 0;
+
+            page = left;
+        }
+    }
+
+    return page;
+}
+
+void free_pages(struct page* page) {
+    if (!page) PANIC("[MEM] Failed to free buddy: null ptr\n"); 
+    if (page->status != PAGE_USED) PANIC("[MEM] Failed to free buddy: page is not marked as used\n");
+    if (page->order >= MAX_ORDER) PANIC("[MEM] Failed to free buddy: order %u exceeds max allowed (%u)\n", page->order, MAX_ORDER-1);
+    if (page->prev || page->next) PANIC("[MEM] Failed to free buddy: page is linked\n");
+
+    page->status = PAGE_DIRTY;
+    
+    page = merge_buddy_with_free(page);
+
+    add_buddy_to_free_list(page);
+}
+
+const struct page* phys_to_page(usize phys) {
+    for (u32 i = 0; i < node_count; i++) {
+        if (phys < nodes[i].addr) continue;
+        usize off = phys - nodes[i].addr;
+        if (off >= nodes[i].size) continue;
+        usize loc_pfn = off / PAGE_SIZE;
+        return &nodes[i].map[loc_pfn];
+    }
+    return NULL;
+}
+
+usize page_to_phys(const struct page* page) {
+    if (!page) return 0;
+    const struct memory_node* node = get_node_from_page(page);
+    if (!node) return 0;
+    usize pfn = get_pfn_from_page(page, node);
+    return pfn * PAGE_SIZE;
+}
+
+void mem_debug() {
     printf("[MEM] Buddy allocator free blocks:\n");
-    usize bytes = 0;
+    u64 bytes = 0;
     for (u32 i = 0; i < MAX_ORDER; i++) {
-        bytes += free_count[i] * ((usize)4096 << i);
+        bytes += (u64)free_count[i] * ((u64)PAGE_SIZE << i);
         printf("  [Order %u]: %lu blocks\n", i, free_count[i]);
     }
     printf("[MEM] Total free memory: %lu KiB\n", bytes / 1024);
